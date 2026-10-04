@@ -1,2 +1,4 @@
-def main() -> None:
-    print("Hello from font-generator!")
+from .main import main
+
+__all__ = ["main"]
+
