@@ -1,12 +1,23 @@
 from __future__ import annotations
 
 import argparse
+import re
+import shutil
 import struct
 import sys
 from pathlib import Path
 from typing import Any
 
+from fontTools.ttLib import TTFont, TTLibError
 from PIL import Image, ImageDraw, ImageFont
+
+
+# TypeSize directory name: style + nominal size, with an "inv" suffix for
+# visually inverted (white-on-black) variants, e.g. regular16 or bold24inv.
+NAME_PATTERN = re.compile(r"(regular|bold|italic|bolditalic)(\d+)(inv)?")
+
+# Smallest size tried when shrinking a source to fit the glyph cell.
+MIN_FIT_SIZE = 4
 
 
 class FontConverter:
@@ -14,17 +25,33 @@ class FontConverter:
 
     The configuration is expected to have global output dimensions and an
     ordered ``fonts`` list. When a codepoint appears in more than one source,
-    the last source selecting it wins.
+    the last source selecting it that actually contains the glyph wins.
     """
 
-    def __init__(self, config: dict[str, Any]):
+    def __init__(self, config: dict[str, Any], config_path: Path | None = None):
         if not isinstance(config, dict):
             raise TypeError("The YAML root must be a mapping/object")
 
         self.config = config
+        self.config_path = config_path
         self.name = str(config.get("name", "")).strip()
         if not self.name:
             raise ValueError("Missing required configuration field: name")
+
+        # The name is a directory that gets deleted and rebuilt on every run,
+        # so it is restricted to the TypeSize naming convention.
+        self.invert = bool(config.get("invert", False))
+        match = NAME_PATTERN.fullmatch(self.name)
+        if match is None:
+            raise ValueError(
+                f"Invalid name {self.name!r}. Expected <style><size>[inv] with style "
+                "regular, bold, italic or bolditalic, e.g. regular16 or bold24inv"
+            )
+        if bool(match.group(3)) != self.invert:
+            raise ValueError(
+                f"Invalid name {self.name!r}: the 'inv' suffix must be used "
+                "exactly when invert is true"
+            )
 
         self.font_size = int(config.get("font_size", 16))
         self.width = int(config.get("width", 0))
@@ -63,9 +90,26 @@ class FontConverter:
             if not font_path.is_file():
                 raise FileNotFoundError(f"Font not found for fonts[{index - 1}]: {font_path}")
 
-            font = ImageFont.truetype(str(font_path), self.font_size)
-            font_name, font_style = font.getname()
-            ascent, descent = font.getmetrics()
+            font_size = int(font_config.get("font_size", self.font_size))
+            if font_size <= 0:
+                raise ValueError(f"fonts[{index - 1}].font_size must be greater than 0")
+
+            # center: center each glyph's ink horizontally in the cell.
+            # left: keep the font's own placement (origin at the left edge),
+            # needed for box drawing glyphs that must touch the cell edges.
+            align = str(font_config.get("align", "center")).strip().lower()
+            if align not in ("center", "left"):
+                raise ValueError(f"fonts[{index - 1}].align must be 'center' or 'left'")
+
+            # The cmap tells which glyphs the font really has; rendering a
+            # missing one would silently produce the font's .notdef box.
+            try:
+                with TTFont(str(font_path), fontNumber=0, lazy=True) as tt_font:
+                    cmap = set(tt_font.getBestCmap() or ())
+            except TTLibError as exc:
+                raise ValueError(
+                    f"Cannot read the cmap of fonts[{index - 1}] ({font_path}): {exc}"
+                ) from exc
 
             ranges = font_config.get("ranges", [])
             individual = font_config.get("individual", [])
@@ -78,32 +122,29 @@ class FontConverter:
             if not isinstance(individual, list):
                 raise ValueError(f"fonts[{index - 1}].individual must be a list")
 
-            self.fonts.append(
-                {
-                    "path": font_path,
-                    "font": font,
-                    "name": font_name,
-                    "style": font_style,
-                    "ascent": ascent,
-                    "descent": descent,
-                    "ranges": ranges,
-                    "individual": individual,
-                    "label": f"font #{index} ({font_path})",
-                }
-            )
+            source: dict[str, Any] = {
+                "index": index - 1,
+                "path": font_path,
+                "configured_size": font_size,
+                "fit": bool(font_config.get("fit", False)),
+                "align": align,
+                "cmap": cmap,
+                "ranges": ranges,
+                "individual": individual,
+                "label": f"font #{index} ({font_path})",
+            }
+            self.load_font(source, font_size)
+            source["name"], source["style"] = source["font"].getname()
+            self.fonts.append(source)
 
         # Baseline is a global property of the output bitmap. If unspecified,
-        # vertically center the primary font's ascent/descent metrics in the
-        # cell. This commonly gives 13 for a 16px font in a 16px-high cell.
+        # it follows the primary font (see auto_baseline).
         self.baseline_explicit = config.get("baseline") is not None
         if self.baseline_explicit:
             self.baseline = int(config["baseline"])
         else:
             primary = self.fonts[0]
-            self.baseline = (
-                self.height + primary["ascent"] - primary["descent"]
-            ) // 2
-            self.baseline = max(0, min(self.baseline, self.height))
+            self.baseline = self.auto_baseline(primary["ascent"], primary["descent"])
 
         if not 0 <= self.baseline <= self.height:
             raise ValueError("baseline must be between 0 and height")
@@ -112,24 +153,62 @@ class FontConverter:
         self.row_bytes = (self.width + 7) // 8
         self.glyph_bytes = self.row_bytes * self.height
 
+        # Framebuffer-native polarity: 1 = white paper, 0 = black ink. An
+        # inverted font draws white glyphs on black, so its background is 0.
+        self.background_byte = 0x00 if self.invert else 0xFF
+
         # Filled by get_glyphs(): maps each selected codepoint to the font
         # definition that wins it. Assignments are deliberately top-to-bottom.
         self.glyph_sources: dict[int, dict[str, Any]] = {}
 
-        print("Font sources:")
+        # Collected while generating and written to the build log; the
+        # terminal only shows a count per category.
+        self.warnings: dict[str, list[str]] = {}
+        self.notes: list[str] = []
+
+    # ======================================================
+    # Font loading and metrics
+    # ======================================================
+
+    @staticmethod
+    def load_font(source: dict[str, Any], size: int) -> None:
+        font = ImageFont.truetype(str(source["path"]), size)
+        source["font"] = font
+        source["size"] = size
+        source["ascent"], source["descent"] = font.getmetrics()
+
+    def auto_baseline(self, ascent: int, descent: int) -> int:
+        # Vertically center the ascent/descent metrics in the cell. If the
+        # font's line height exceeds the cell, both ends get clipped.
+        baseline = (self.height + ascent - descent) // 2
+        return max(0, min(baseline, self.height))
+
+    def warn(self, category: str, message: str) -> None:
+        self.warnings.setdefault(category, []).append(message)
+
+    def describe(self) -> list[str]:
+        lines = ["Font sources:"]
         for index, source in enumerate(self.fonts, start=1):
-            print(
+            size = f"{source['size']}px"
+            if source["size"] != source["configured_size"]:
+                size += f" (fit from {source['configured_size']}px)"
+            lines.append(
                 f"  {index}. {source['name']}, {source['style']} "
-                f"({source['path']}) — ascent={source['ascent']}px, "
+                f"({source['path']}) — {size}, align={source['align']}, "
+                f"ascent={source['ascent']}px, "
                 f"descent={source['descent']}px"
             )
-        print(f"Glyph cell: {self.width}x{self.height}px")
-        print(f"Font size: {self.font_size}px")
-        print(
+        lines.append(f"Glyph cell: {self.width}x{self.height}px")
+        lines.append(
             f"Baseline: {self.baseline}px"
             + (" (explicit)" if self.baseline_explicit else " (automatic)")
         )
-        print(f"Glyph storage: {self.glyph_bytes} bytes")
+        lines.append(
+            "Polarity: "
+            + ("inverted (white on black)" if self.invert else "normal (black on white)")
+        )
+        lines.append(f"Glyph storage: {self.glyph_bytes} bytes")
+        return lines
 
     # ======================================================
     # Unicode helpers
@@ -183,25 +262,65 @@ class FontConverter:
         return start, end
 
     def get_glyphs(self) -> list[int]:
-        """Get all selected codepoints; the last matching font wins."""
+        """Get all selected codepoints; the last font containing one wins."""
         self.glyph_sources = {}
+        missing: dict[int, list[dict[str, Any]]] = {}
 
         for source in self.fonts:
             selected: set[int] = set()
 
             for value in source["ranges"]:
                 start, end = self.parse_range(value)
-                selected.update(range(start, end + 1))
+                # Surrogates are not Unicode scalar values and can't be stored.
+                valid = {
+                    codepoint
+                    for codepoint in range(start, end + 1)
+                    if self.is_valid_codepoint(codepoint)
+                }
+                if len(valid) != end - start + 1:
+                    self.warn(
+                        "surrogates",
+                        f"{value} in {source['label']}: dropped U+D800-U+DFFF",
+                    )
+                selected.update(valid)
 
             for value in source["individual"]:
                 selected.add(self.parse_codepoint(value))
 
             # Overwrite the source for matching codepoints. This is the core
-            # overlay rule: later entries in `fonts` take precedence.
+            # overlay rule: later entries in `fonts` take precedence, but only
+            # for glyphs they actually contain, so a font lacking a glyph
+            # never replaces an earlier font's real glyph with .notdef.
             for codepoint in selected:
-                self.glyph_sources[codepoint] = source
+                if codepoint in source["cmap"]:
+                    self.glyph_sources[codepoint] = source
+                else:
+                    missing.setdefault(codepoint, []).append(source)
+
+        for codepoint, sources in sorted(missing.items()):
+            winner = self.glyph_sources.get(codepoint)
+            if winner is None:
+                lacking = ", ".join(source["label"] for source in sources)
+                self.warn(
+                    "missing-everywhere",
+                    f"U+{codepoint:04X} not in {lacking}; undefined.bmp will be used",
+                )
+                continue
+
+            # A font earlier than the winner would have been overridden
+            # anyway; only a later font that lacked the glyph is worth noting.
+            later = [source for source in sources if source["index"] > winner["index"]]
+            if later:
+                lacking = ", ".join(source["label"] for source in later)
+                self.warn(
+                    "missing-in-source",
+                    f"U+{codepoint:04X} not in {lacking}; using {winner['label']}",
+                )
 
         return sorted(self.glyph_sources)
+
+    def won_by(self, source: dict[str, Any], glyphs: list[int]) -> list[int]:
+        return [codepoint for codepoint in glyphs if self.glyph_sources[codepoint] is source]
 
     # ======================================================
     # Render glyph / convert bitmap
@@ -211,23 +330,54 @@ class FontConverter:
         self,
         codepoint: int,
         font: ImageFont.FreeTypeFont | ImageFont.ImageFont | None = None,
-    ) -> Image.Image:
+        baseline: int | None = None,
+        align: str | None = None,
+    ) -> tuple[Image.Image, list[str]]:
+        """Render a glyph into the cell; also report which cell edges, if
+        any, clipped it. Font and alignment default to the winning source."""
+        source = self.glyph_sources.get(codepoint)
         if font is None:
-            source = self.glyph_sources.get(codepoint)
             if source is None:
                 raise KeyError(f"No font source selected for U+{codepoint:04X}")
             font = source["font"]
+        if baseline is None:
+            baseline = self.baseline
+        if align is None:
+            align = source["align"] if source is not None else "left"
 
-        image = Image.new("1", (self.width, self.height), 0)
-        draw = ImageDraw.Draw(image)
+        # Draw on a canvas with a margin around the cell, so ink that falls
+        # outside the cell is still there to be detected before cropping.
+        pad = max(self.width, self.height)
+        canvas = Image.new("1", (self.width + 2 * pad, self.height + 2 * pad), 0)
+        draw = ImageDraw.Draw(canvas)
         draw.text(
-            (0, self.baseline),
+            (pad, baseline + pad),
             chr(codepoint),
             font=font,
             fill=1,
             anchor="ls",
         )
-        return image
+
+        # The cell is a window into the canvas. Centering moves the window
+        # over the ink horizontally; the baseline alone decides the vertical
+        # position, so text from different fonts still lines up.
+        window = pad
+        clipped: list[str] = []
+        bbox = canvas.getbbox()
+        if bbox is not None:
+            left, top, right, bottom = bbox
+            if align == "center":
+                window = left - (self.width - (right - left)) // 2
+            outside = (
+                ("left", left < window),
+                ("top", top < pad),
+                ("right", right > window + self.width),
+                ("bottom", bottom > pad + self.height),
+            )
+            clipped = [edge for edge, is_outside in outside if is_outside]
+
+        image = canvas.crop((window, pad, window + self.width, pad + self.height))
+        return image, clipped
 
     def image_to_bitmap(self, image: Image.Image) -> bytes:
         output = bytearray(self.glyph_bytes)
@@ -237,10 +387,105 @@ class FontConverter:
                     byte_index = y * self.row_bytes + x // 8
                     bit = 7 - (x & 7)
                     output[byte_index] |= 1 << bit
+
+        # Ink was packed as 1 above. The framebuffer uses 1 for white paper,
+        # so flip everything; this also turns row padding into background.
+        if not self.invert:
+            output = bytearray(byte ^ 0xFF for byte in output)
         return bytes(output)
 
     def generate_glyph(self, codepoint: int) -> bytes:
-        return self.image_to_bitmap(self.render_glyph(codepoint))
+        return self.image_to_bitmap(self.render_glyph(codepoint)[0])
+
+    # ======================================================
+    # Fitting glyphs into the cell
+    # ======================================================
+
+    def fit_size(
+        self,
+        source: dict[str, Any],
+        codepoints: list[int],
+        primary: bool,
+    ) -> tuple[int | None, int | None]:
+        """Find the largest size, starting at the configured one, at which
+        none of ``codepoints`` is clipped.
+
+        Returns ``(size, limit)``: ``limit`` is the first glyph that still
+        clips one size larger, and ``size`` is None if even MIN_FIT_SIZE clips.
+        The whole source is sized as one, so its glyphs stay consistent.
+        """
+        limit = None
+        for size in range(source["configured_size"], MIN_FIT_SIZE - 1, -1):
+            font = ImageFont.truetype(str(source["path"]), size)
+            baseline = self.baseline
+            if primary and not self.baseline_explicit:
+                baseline = self.auto_baseline(*font.getmetrics())
+
+            clipped = [
+                codepoint
+                for codepoint in codepoints
+                if self.render_glyph(codepoint, font, baseline, source["align"])[1]
+            ]
+            if not clipped:
+                return size, limit
+            limit = clipped[0]
+        return None, limit
+
+    def resolve_sizes(self, glyphs: list[int]) -> None:
+        """Shrink every source with ``fit: true`` until its glyphs fit.
+
+        The primary source goes first because it sets the automatic baseline
+        that every other source is then fitted against.
+        """
+        for source in self.fonts:
+            if not source["fit"]:
+                continue
+
+            primary = source["index"] == 0
+            configured = source["configured_size"]
+            size, limit = self.fit_size(source, self.won_by(source, glyphs), primary)
+            if size is None:
+                self.warn(
+                    "fit",
+                    f"{source['label']}: U+{limit:04X} still clips at "
+                    f"{MIN_FIT_SIZE}px; keeping {configured}px",
+                )
+                continue
+
+            self.load_font(source, size)
+            if primary and not self.baseline_explicit:
+                self.baseline = self.auto_baseline(source["ascent"], source["descent"])
+
+            if limit is None:
+                self.notes.append(f"Fit: {source['label']} fits at {size}px")
+            else:
+                self.notes.append(
+                    f"Fit: {source['label']} {configured}px -> {size}px "
+                    f"(U+{limit:04X} clips at {size + 1}px)"
+                )
+
+    def warn_clipped(
+        self,
+        glyphs: list[int],
+        clipped: dict[int, list[tuple[int, list[str]]]],
+    ) -> None:
+        for index, entries in sorted(clipped.items()):
+            source = self.fonts[index]
+            size, limit = self.fit_size(source, self.won_by(source, glyphs), index == 0)
+            if size is None:
+                hint = (
+                    f"source does not fit even at {MIN_FIT_SIZE}px "
+                    f"(U+{limit:04X} still clips)"
+                )
+            else:
+                hint = f"source fits at {size}px"
+
+            for codepoint, edges in entries:
+                self.warn(
+                    "clipped",
+                    f"U+{codepoint:04X} from {source['label']} at "
+                    f"{source['size']}px, clipped {'/'.join(edges)}; {hint}",
+                )
 
     # ======================================================
     # Metadata and undefined glyph
@@ -309,16 +554,17 @@ class FontConverter:
 
         for chunk, chunk_glyphs in sorted(chunks.items()):
             # Rebuild each chunk from the final merged glyph map. This is
-            # important: an overlay must not zero out unrelated earlier glyphs
-            # that occupy other slots in this same 32-codepoint chunk.
-            chunk_data = bytearray(self.glyph_bytes * 32)
+            # important: an overlay must not blank out unrelated earlier glyphs
+            # that occupy other slots in this same 32-codepoint chunk. Unused
+            # slots hold plain background.
+            chunk_data = bytearray([self.background_byte]) * (self.glyph_bytes * 32)
             for codepoint in chunk_glyphs:
                 slot = codepoint & 0x1F
                 offset = slot * self.glyph_bytes
                 bitmap = bitmaps[codepoint]
                 chunk_data[offset : offset + self.glyph_bytes] = bitmap
 
-            (range_dir / f"{chunk:04X}.bmp").write_bytes(bytes(chunk_data))
+            (range_dir / f"{chunk:06X}.bmp").write_bytes(bytes(chunk_data))
 
     # ======================================================
     # Preview
@@ -326,7 +572,7 @@ class FontConverter:
 
     def preview_glyph(self, codepoint: int) -> None:
         source = self.glyph_sources[codepoint]
-        image = self.render_glyph(codepoint, source["font"])
+        image, _ = self.render_glyph(codepoint, source["font"])
         character = chr(codepoint)
 
         print()
@@ -344,12 +590,50 @@ class FontConverter:
         print()
 
     # ======================================================
+    # Build log
+    # ======================================================
+
+    def write_log(self, glyphs: list[int], summary: list[str]) -> None:
+        """Write the full build log next to the font directory (so it is
+        never flashed) and print one line per warning category."""
+        lines = [f"Config: {self.config_path or '(not given)'}", ""]
+        lines += self.describe()
+        if self.notes:
+            lines += ["", *self.notes]
+        if summary:
+            lines += ["", *summary]
+
+        lines += ["", "Glyphs:"]
+        for codepoint in glyphs:
+            source = self.glyph_sources[codepoint]
+            lines.append(
+                f"  U+{codepoint:04X} {chr(codepoint)!r} <- {source['label']} "
+                f"at {source['size']}px"
+            )
+
+        for category, messages in self.warnings.items():
+            lines += ["", f"Warnings ({category}): {len(messages)}"]
+            lines += [f"  {message}" for message in messages]
+
+        self.output_root.mkdir(parents=True, exist_ok=True)
+        log_path = self.output_root / f"{self.name}.log"
+        log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        if self.warnings:
+            print("\nWarnings:")
+            for category, messages in self.warnings.items():
+                print(f"  {category}: {len(messages)}")
+        print(f"Build log:      {log_path}")
+
+    # ======================================================
     # Generate output
     # ======================================================
 
     def generate(self) -> None:
         glyphs = self.get_glyphs()
+        self.resolve_sizes(glyphs)
 
+        print("\n".join(self.describe()))
         print()
         print(f"Generating: {self.name}")
         print(f"Font sources: {len(self.fonts)}")
@@ -357,21 +641,36 @@ class FontConverter:
 
         if not glyphs:
             print("No glyphs selected; nothing to write.")
+            self.write_log(glyphs, [])
             return
 
+        # Rebuild the font directory from scratch: range directories or
+        # chunks left over from an earlier config would still be found by
+        # the device. The name is validated, but refuse anything (such as a
+        # symlink) that resolves outside the output root.
         output_dir = self.output_root / self.name
-        output_dir.mkdir(parents=True, exist_ok=True)
+        self.output_root.mkdir(parents=True, exist_ok=True)
+        if output_dir.resolve().parent != self.output_root.resolve():
+            raise ValueError(
+                f"Refusing to replace {output_dir}: it resolves outside {self.output_root}"
+            )
+        if output_dir.exists():
+            shutil.rmtree(output_dir)
+        output_dir.mkdir()
 
         self.write_info(output_dir)
         self.write_undefined(output_dir)
 
         print("\nRasterizing final glyphs...")
         bitmaps: dict[int, bytes] = {}
+        clipped: dict[int, list[tuple[int, list[str]]]] = {}
         for codepoint in glyphs:
             source = self.glyph_sources[codepoint]
-            bitmaps[codepoint] = self.image_to_bitmap(
-                self.render_glyph(codepoint, source["font"])
-            )
+            image, edges = self.render_glyph(codepoint, source["font"])
+            bitmaps[codepoint] = self.image_to_bitmap(image)
+            if edges:
+                clipped.setdefault(source["index"], []).append((codepoint, edges))
+        self.warn_clipped(glyphs, clipped)
 
         ranges: dict[int, list[int]] = {}
         for codepoint in glyphs:
@@ -391,18 +690,23 @@ class FontConverter:
         info_bytes = 12
         total_bytes = info_bytes + undefined_bytes + index_bytes + bitmap_bytes
 
+        summary = [
+            f"Glyphs:         {len(glyphs)}",
+            f"Ranges:         {len(ranges)}",
+            f"Chunks:         {chunk_count}",
+            f"Glyph size:     {self.glyph_bytes} bytes",
+            f"Index storage:  {index_bytes} bytes",
+            f"Bitmap storage: {bitmap_bytes} bytes",
+            f"Total storage:  {total_bytes} bytes",
+            f"Output:         {output_dir}",
+        ]
+
         print()
         print("=" * 60)
         print(f"Generated:      {self.name}")
         print("=" * 60)
-        print(f"Glyphs:         {len(glyphs)}")
-        print(f"Ranges:         {len(ranges)}")
-        print(f"Chunks:         {chunk_count}")
-        print(f"Glyph size:     {self.glyph_bytes} bytes")
-        print(f"Index storage:  {index_bytes} bytes")
-        print(f"Bitmap storage: {bitmap_bytes} bytes")
-        print(f"Total storage:  {total_bytes} bytes")
-        print(f"Output:         {output_dir}")
+        print("\n".join(summary))
+        self.write_log(glyphs, summary)
 
         if self.preview_enabled:
             count = min(self.preview_count, len(glyphs))
@@ -451,7 +755,7 @@ def main() -> int:
 
     try:
         config = load_yaml_config(args.config)
-        FontConverter(config).generate()
+        FontConverter(config, args.config).generate()
     except (OSError, ValueError, TypeError, RuntimeError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

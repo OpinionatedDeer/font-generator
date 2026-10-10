@@ -1,9 +1,10 @@
-name: regular16
+name: regular16        # <style><size>[inv]; style: regular, bold, italic, bolditalic
 
-font_size: 16
+font_size: 16          # default for every entry in `fonts`
 width: 16
 height: 16
 # baseline: 13
+# invert: false        # true = white glyphs on black; name must end in "inv"
 
 # output: output
 
@@ -12,6 +13,10 @@ preview_count: 100
 
 fonts:
   - font: fonts/0xProtoNerdFont-Regular.ttf
+    # font_size: 16      # override the global font_size for this entry
+    # fit: false         # true = shrink this entry until all its glyphs fit the cell
+    # align: center      # center = center each glyph's ink horizontally;
+    #                    # left = font's own placement (use for box drawing)
 
     ranges:
       - U+0020-U+007E

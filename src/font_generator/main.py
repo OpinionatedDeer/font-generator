@@ -24,7 +24,7 @@ def main():
         with open(config_path, "r", encoding="utf-8") as fp:
             config = yaml.safe_load(fp)
 
-        converter = FontConverter(config)
+        converter = FontConverter(config, config_path)
         converter.generate()
 
         print()
