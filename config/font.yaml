@@ -1,10 +1,11 @@
-name: regular16        # <style><size>[inv]; style: regular, bold, italic, bolditalic
+name: regular16        # <style><cell height>[inv]; style: regular, bold, italic, bolditalic
 
 font_size: 16          # default for every entry in `fonts`
-width: 16
-height: 16
+width: 8               # text cell; keep a multiple of 8 for byte-aligned copies
+height: 16             # must match the number in `name`
 # baseline: 13
 # invert: false        # true = white glyphs on black; name must end in "inv"
+# blank: [U+200D, U+FE0E, U+FE0F]   # stored as empty glyphs (default list)
 
 # output: output
 
@@ -12,26 +13,42 @@ preview: true
 preview_count: 100
 
 fonts:
+  # Text. The first entry also sets the automatic baseline.
   - font: fonts/0xProtoNerdFont-Regular.ttf
+    fit: true            # true = shrink this entry until all its glyphs fit the cell
     # font_size: 16      # override the global font_size for this entry
-    # fit: false         # true = shrink this entry until all its glyphs fit the cell
     # align: center      # center = center each glyph's ink horizontally;
     #                    # left = font's own placement (use for box drawing)
-
+    # wide: false        # true = two cells wide; its 256-codepoint ranges become wide
     ranges:
       - U+0020-U+007E
+
+  # Latin-1. Test font: a proportional font has to shrink a lot to fit
+  # 8px, so pick a monospace one.
+  - font: fonts/FiraSans-Regular.ttf
+    fit: true
+    ranges:
       - U+00A0-U+00FF
 
+  # Nerd Font icons, two cells wide.
+  - font: fonts/0xProtoNerdFont-Regular.ttf
+    wide: true
+    fit: true
     individual:
       - U+F013
       - U+F240
       - U+F241
 
-  - font: fonts/FiraSans-Regular.ttf
-
+  # Emoji, two cells wide. Needs a monochrome outline font; colour emoji
+  # fonts (e.g. Noto Color Emoji) don't rasterize to 1-bit.
+  - font: /usr/share/fonts/noto-emoji/NotoEmoji-Regular.ttf
+    wide: true
+    fit: true
     ranges:
-      - U+0020-U+002E
-      - U+00A0-U+00FF
-
-    individual:
-      - U+F241
+      - U+2600-U+26FF    # Miscellaneous Symbols
+      - U+2700-U+27BF    # Dingbats
+      - U+1F300-U+1F5FF  # Miscellaneous Symbols and Pictographs
+      - U+1F600-U+1F64F  # Emoticons
+      - U+1F680-U+1F6FF  # Transport and Map Symbols
+      - U+1F900-U+1F9FF  # Supplemental Symbols and Pictographs
+      - U+1FA70-U+1FAFF  # Symbols and Pictographs Extended-A

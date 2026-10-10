@@ -15,6 +15,7 @@ dependencies = [
 
 [project.scripts]
 font-generator = "font_generator:main"
+font-viewer = "font_generator.font_viewer:main"
 
 [build-system]
 requires = ["uv_build>=0.12.3,<0.13.0"]

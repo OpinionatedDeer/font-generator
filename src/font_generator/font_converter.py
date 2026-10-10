@@ -11,8 +11,10 @@ from typing import Any
 from fontTools.ttLib import TTFont, TTLibError
 from PIL import Image, ImageDraw, ImageFont
 
+from .font_viewer import EftFont, glyph_lines, verify
 
-# TypeSize directory name: style + nominal size, with an "inv" suffix for
+
+# TypeSize directory name: style + cell height, with an "inv" suffix for
 # visually inverted (white-on-black) variants, e.g. regular16 or bold24inv.
 NAME_PATTERN = re.compile(r"(regular|bold|italic|bolditalic)(\d+)(inv)?")
 
@@ -44,7 +46,7 @@ class FontConverter:
         match = NAME_PATTERN.fullmatch(self.name)
         if match is None:
             raise ValueError(
-                f"Invalid name {self.name!r}. Expected <style><size>[inv] with style "
+                f"Invalid name {self.name!r}. Expected <style><cell height>[inv] with style "
                 "regular, bold, italic or bolditalic, e.g. regular16 or bold24inv"
             )
         if bool(match.group(3)) != self.invert:
@@ -70,6 +72,19 @@ class FontConverter:
             raise ValueError("width and height must fit in an unsigned 16-bit integer")
         if self.preview_count < 0:
             raise ValueError("preview_count cannot be negative")
+        if int(match.group(2)) != self.height:
+            raise ValueError(
+                f"Invalid name {self.name!r}: the number is the cell height, "
+                f"but height is {self.height}"
+            )
+
+        # Stored as empty glyphs so emoji sequences such as U+2764 U+FE0F
+        # show a blank cell instead of the undefined box. They are invisible
+        # in text, and this format has no zero-width glyphs.
+        blank = config.get("blank", ["U+200D", "U+FE0E", "U+FE0F"])
+        if not isinstance(blank, list):
+            raise ValueError("blank must be a list of codepoints")
+        self.blank = {self.parse_codepoint(value) for value in blank}
 
         font_configs = config.get("fonts")
         if not isinstance(font_configs, list) or not font_configs:
@@ -128,6 +143,9 @@ class FontConverter:
                 "configured_size": font_size,
                 "fit": bool(font_config.get("fit", False)),
                 "align": align,
+                # Wide glyphs (emoji, icons) take two cells; the whole
+                # 256-codepoint range they are in becomes wide.
+                "wide": bool(font_config.get("wide", False)),
                 "cmap": cmap,
                 "ranges": ranges,
                 "individual": individual,
@@ -149,9 +167,7 @@ class FontConverter:
         if not 0 <= self.baseline <= self.height:
             raise ValueError("baseline must be between 0 and height")
 
-        # Bitmap sizes: rows are byte-padded, with pixels stored MSB-first.
-        self.row_bytes = (self.width + 7) // 8
-        self.glyph_bytes = self.row_bytes * self.height
+        self.glyph_bytes = self.glyph_size(self.width)
 
         # Framebuffer-native polarity: 1 = white paper, 0 = black ink. An
         # inverted font draws white glyphs on black, so its background is 0.
@@ -165,6 +181,13 @@ class FontConverter:
         # terminal only shows a count per category.
         self.warnings: dict[str, list[str]] = {}
         self.notes: list[str] = []
+
+        if self.width % 8:
+            self.warn(
+                "layout",
+                f"width {self.width} is not a multiple of 8, so glyph rows can't be "
+                "copied byte-for-byte into the framebuffer",
+            )
 
     # ======================================================
     # Font loading and metrics
@@ -186,6 +209,13 @@ class FontConverter:
     def warn(self, category: str, message: str) -> None:
         self.warnings.setdefault(category, []).append(message)
 
+    def cell_width(self, wide: bool) -> int:
+        return self.width * 2 if wide else self.width
+
+    def glyph_size(self, width: int) -> int:
+        # Bitmap sizes: rows are byte-padded, with pixels stored MSB-first.
+        return (width + 7) // 8 * self.height
+
     def describe(self) -> list[str]:
         lines = ["Font sources:"]
         for index, source in enumerate(self.fonts, start=1):
@@ -195,10 +225,13 @@ class FontConverter:
             lines.append(
                 f"  {index}. {source['name']}, {source['style']} "
                 f"({source['path']}) — {size}, align={source['align']}, "
-                f"ascent={source['ascent']}px, "
-                f"descent={source['descent']}px"
+                + ("wide, " if source["wide"] else "")
+                + f"ascent={source['ascent']}px, descent={source['descent']}px"
             )
-        lines.append(f"Glyph cell: {self.width}x{self.height}px")
+        lines.append(
+            f"Glyph cell: {self.width}x{self.height}px "
+            f"(wide: {self.cell_width(True)}x{self.height}px)"
+        )
         lines.append(
             f"Baseline: {self.baseline}px"
             + (" (explicit)" if self.baseline_explicit else " (automatic)")
@@ -207,7 +240,10 @@ class FontConverter:
             "Polarity: "
             + ("inverted (white on black)" if self.invert else "normal (black on white)")
         )
-        lines.append(f"Glyph storage: {self.glyph_bytes} bytes")
+        lines.append(
+            f"Glyph storage: {self.glyph_bytes} bytes "
+            f"(wide: {self.glyph_size(self.cell_width(True))} bytes)"
+        )
         return lines
 
     # ======================================================
@@ -299,6 +335,8 @@ class FontConverter:
 
         for codepoint, sources in sorted(missing.items()):
             winner = self.glyph_sources.get(codepoint)
+            if winner is None and codepoint in self.blank:
+                continue  # stored as a blank glyph instead
             if winner is None:
                 lacking = ", ".join(source["label"] for source in sources)
                 self.warn(
@@ -329,26 +367,30 @@ class FontConverter:
     def render_glyph(
         self,
         codepoint: int,
+        source: dict[str, Any] | None = None,
         font: ImageFont.FreeTypeFont | ImageFont.ImageFont | None = None,
         baseline: int | None = None,
-        align: str | None = None,
     ) -> tuple[Image.Image, list[str]]:
-        """Render a glyph into the cell; also report which cell edges, if
-        any, clipped it. Font and alignment default to the winning source."""
-        source = self.glyph_sources.get(codepoint)
-        if font is None:
+        """Render a glyph into its cell; also report which cell edges, if
+        any, clipped it.
+
+        ``source`` (default: the winning one) decides the cell width and the
+        alignment; ``font`` and ``baseline`` can be overridden for fitting.
+        """
+        if source is None:
+            source = self.glyph_sources.get(codepoint)
             if source is None:
                 raise KeyError(f"No font source selected for U+{codepoint:04X}")
+        if font is None:
             font = source["font"]
         if baseline is None:
             baseline = self.baseline
-        if align is None:
-            align = source["align"] if source is not None else "left"
+        width = self.cell_width(source["wide"])
 
         # Draw on a canvas with a margin around the cell, so ink that falls
         # outside the cell is still there to be detected before cropping.
-        pad = max(self.width, self.height)
-        canvas = Image.new("1", (self.width + 2 * pad, self.height + 2 * pad), 0)
+        pad = max(width, self.height)
+        canvas = Image.new("1", (width + 2 * pad, self.height + 2 * pad), 0)
         draw = ImageDraw.Draw(canvas)
         draw.text(
             (pad, baseline + pad),
@@ -366,25 +408,26 @@ class FontConverter:
         bbox = canvas.getbbox()
         if bbox is not None:
             left, top, right, bottom = bbox
-            if align == "center":
-                window = left - (self.width - (right - left)) // 2
+            if source["align"] == "center":
+                window = left - (width - (right - left)) // 2
             outside = (
                 ("left", left < window),
                 ("top", top < pad),
-                ("right", right > window + self.width),
+                ("right", right > window + width),
                 ("bottom", bottom > pad + self.height),
             )
             clipped = [edge for edge, is_outside in outside if is_outside]
 
-        image = canvas.crop((window, pad, window + self.width, pad + self.height))
+        image = canvas.crop((window, pad, window + width, pad + self.height))
         return image, clipped
 
     def image_to_bitmap(self, image: Image.Image) -> bytes:
-        output = bytearray(self.glyph_bytes)
+        row_bytes = (image.width + 7) // 8
+        output = bytearray(row_bytes * self.height)
         for y in range(self.height):
-            for x in range(self.width):
+            for x in range(image.width):
                 if image.getpixel((x, y)):
-                    byte_index = y * self.row_bytes + x // 8
+                    byte_index = y * row_bytes + x // 8
                     bit = 7 - (x & 7)
                     output[byte_index] |= 1 << bit
 
@@ -424,7 +467,7 @@ class FontConverter:
             clipped = [
                 codepoint
                 for codepoint in codepoints
-                if self.render_glyph(codepoint, font, baseline, source["align"])[1]
+                if self.render_glyph(codepoint, source, font, baseline)[1]
             ]
             if not clipped:
                 return size, limit
@@ -530,15 +573,41 @@ class FontConverter:
     def chunk_start(codepoint: int) -> int:
         return codepoint & ~0x1F
 
+    def find_wide_ranges(self, glyphs: list[int]) -> set[int]:
+        """Ranges whose glyphs come from ``wide`` sources. A range is wide
+        or not as a whole, so mixing both kinds in one range is an error."""
+        kinds: dict[int, dict[bool, set[str]]] = {}
+        for codepoint in glyphs:
+            source = self.glyph_sources[codepoint]
+            page = kinds.setdefault(self.range_start(codepoint), {})
+            page.setdefault(source["wide"], set()).add(source["label"])
+
+        for page, by_kind in sorted(kinds.items()):
+            if len(by_kind) > 1:
+                raise ValueError(
+                    f"Range {page:06X} mixes wide glyphs from "
+                    f"{', '.join(sorted(by_kind[True]))} with normal ones from "
+                    f"{', '.join(sorted(by_kind[False]))}; a 256-codepoint range "
+                    "is either wide or not"
+                )
+        return {page for page, by_kind in kinds.items() if True in by_kind}
+
     def generate_range(
         self,
         range_start: int,
         glyphs: list[int],
         bitmaps: dict[int, bytes],
         output_dir: Path,
+        wide: bool,
     ) -> None:
         range_dir = output_dir / f"{range_start:06X}"
         range_dir.mkdir(parents=True, exist_ok=True)
+
+        # An empty "wide" file marks every glyph of the range as two cells
+        # wide; its chunks then use double-width slots.
+        if wide:
+            (range_dir / "wide").write_bytes(b"")
+        glyph_bytes = self.glyph_size(self.cell_width(wide))
 
         # Presence index: one bit for each codepoint in this 256-codepoint page.
         index = bytearray(32)
@@ -557,12 +626,12 @@ class FontConverter:
             # important: an overlay must not blank out unrelated earlier glyphs
             # that occupy other slots in this same 32-codepoint chunk. Unused
             # slots hold plain background.
-            chunk_data = bytearray([self.background_byte]) * (self.glyph_bytes * 32)
+            chunk_data = bytearray([self.background_byte]) * (glyph_bytes * 32)
             for codepoint in chunk_glyphs:
                 slot = codepoint & 0x1F
-                offset = slot * self.glyph_bytes
+                offset = slot * glyph_bytes
                 bitmap = bitmaps[codepoint]
-                chunk_data[offset : offset + self.glyph_bytes] = bitmap
+                chunk_data[offset : offset + glyph_bytes] = bitmap
 
             (range_dir / f"{chunk:06X}.bmp").write_bytes(bytes(chunk_data))
 
@@ -570,24 +639,13 @@ class FontConverter:
     # Preview
     # ======================================================
 
-    def preview_glyph(self, codepoint: int) -> None:
+    def preview_glyph(self, stored: EftFont, codepoint: int) -> None:
+        # Shows the bytes as written to disk, read back the firmware's way.
         source = self.glyph_sources[codepoint]
-        image, _ = self.render_glyph(codepoint, source["font"])
-        character = chr(codepoint)
-
+        title, *art = glyph_lines(stored, codepoint)
         print()
-        print(f"U+{codepoint:04X} {character!r} {self.width}x{self.height} — {source['path']}")
-        print()
-        for y in range(self.height):
-            line = "".join(
-                "##" if image.getpixel((x, y)) else "  "
-                for x in range(self.width)
-            )
-            if y == self.baseline:
-                print(line + "  <- baseline")
-            else:
-                print(line)
-        print()
+        print(f"{title} — {source['label']} at {source['size']}px")
+        print("\n".join(art))
 
     # ======================================================
     # Build log
@@ -631,7 +689,15 @@ class FontConverter:
 
     def generate(self) -> None:
         glyphs = self.get_glyphs()
+        wide_ranges = self.find_wide_ranges(glyphs)
         self.resolve_sizes(glyphs)
+
+        # Blank glyphs only fill in where no font provides the codepoint.
+        blanks = sorted(self.blank - set(glyphs))
+        if blanks:
+            self.notes.append(
+                "Blank glyphs: " + " ".join(f"U+{codepoint:04X}" for codepoint in blanks)
+            )
 
         print("\n".join(self.describe()))
         print()
@@ -666,38 +732,54 @@ class FontConverter:
         clipped: dict[int, list[tuple[int, list[str]]]] = {}
         for codepoint in glyphs:
             source = self.glyph_sources[codepoint]
-            image, edges = self.render_glyph(codepoint, source["font"])
+            image, edges = self.render_glyph(codepoint)
             bitmaps[codepoint] = self.image_to_bitmap(image)
             if edges:
                 clipped.setdefault(source["index"], []).append((codepoint, edges))
         self.warn_clipped(glyphs, clipped)
 
+        for codepoint in blanks:
+            wide = self.range_start(codepoint) in wide_ranges
+            empty = Image.new("1", (self.cell_width(wide), self.height), 0)
+            bitmaps[codepoint] = self.image_to_bitmap(empty)
+
         ranges: dict[int, list[int]] = {}
-        for codepoint in glyphs:
+        for codepoint in sorted(bitmaps):
             page = self.range_start(codepoint)
             ranges.setdefault(page, []).append(codepoint)
 
         for page, page_glyphs in sorted(ranges.items()):
-            self.generate_range(page, page_glyphs, bitmaps, output_dir)
+            self.generate_range(page, page_glyphs, bitmaps, output_dir, page in wide_ranges)
 
-        chunk_count = sum(
-            len({self.chunk_start(codepoint) for codepoint in page_glyphs})
-            for page_glyphs in ranges.values()
-        )
+        chunks = {self.chunk_start(codepoint) for codepoint in bitmaps}
+        chunk_count = len(chunks)
         index_bytes = len(ranges) * 32
-        bitmap_bytes = chunk_count * 32 * self.glyph_bytes
+        bitmap_bytes = sum(
+            32 * self.glyph_size(self.cell_width(self.range_start(chunk) in wide_ranges))
+            for chunk in chunks
+        )
         undefined_bytes = self.glyph_bytes
         info_bytes = 12
         total_bytes = info_bytes + undefined_bytes + index_bytes + bitmap_bytes
 
+        # Read the written files back with the independent reader, so the
+        # output is checked the way the firmware will read it.
+        stored = EftFont(output_dir)
+        problems = verify(stored)
+        for problem in problems:
+            self.warn("format", problem)
+
         summary = [
-            f"Glyphs:         {len(glyphs)}",
-            f"Ranges:         {len(ranges)}",
+            f"Glyphs:         {len(glyphs)}"
+            + (f" (+{len(blanks)} blank)" if blanks else ""),
+            f"Ranges:         {len(ranges)} ({len(wide_ranges)} wide)",
             f"Chunks:         {chunk_count}",
-            f"Glyph size:     {self.glyph_bytes} bytes",
+            f"Glyph size:     {self.glyph_bytes} bytes "
+            f"(wide: {self.glyph_size(self.cell_width(True))} bytes)",
             f"Index storage:  {index_bytes} bytes",
             f"Bitmap storage: {bitmap_bytes} bytes",
             f"Total storage:  {total_bytes} bytes",
+            f"Format check:   {'OK' if not problems else f'{len(problems)} problem(s)'}",
             f"Output:         {output_dir}",
         ]
 
@@ -708,11 +790,17 @@ class FontConverter:
         print("\n".join(summary))
         self.write_log(glyphs, summary)
 
+        if problems:
+            raise RuntimeError(
+                f"{output_dir} fails the format check ({len(problems)} problem(s)); "
+                "see the build log"
+            )
+
         if self.preview_enabled:
             count = min(self.preview_count, len(glyphs))
             print(f"\nPreviewing {count} glyph(s) in terminal...")
             for codepoint in glyphs[:count]:
-                self.preview_glyph(codepoint)
+                self.preview_glyph(stored, codepoint)
 
 
 def load_yaml_config(config_path: Path) -> dict[str, Any]:
