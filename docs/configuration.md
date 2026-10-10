@@ -53,7 +53,9 @@ fonts:
 
 ### Writing codepoints
 
-Always write `U+XXXX`, e.g. `U+0041`. YAML reads unquoted numbers before the generator sees them, so they silently become the wrong character: `0041` turns into U+0033 and `0x41` into U+0065. A quoted single character such as `'A'` also works.
+Always write `U+XXXX`, e.g. `U+0041`. A quoted single character such as `'A'` also works.
+
+YAML reads unquoted numbers before the generator sees them, so their hex spelling is lost: `0041` arrives as 33 and `0x41` as 65. The build therefore stops with an error for any codepoint YAML read as a number, naming the font entry (or `blank`) it was in.
 
 ### Which font wins
 

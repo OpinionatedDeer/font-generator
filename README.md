@@ -14,7 +14,7 @@ This repository contains the PC-side tools:
 
 - Python 3.13 or newer (`.python-version` pins 3.14)
 - [uv](https://docs.astral.sh/uv/)
-- The TTF/OTF files your config refers to. They aren't in the repository (`*.ttf` is gitignored); put them in `fonts/`.
+- The TTF/OTF files your config refers to. They aren't in the repository (`*.ttf` and `*.otf` are gitignored); put them in `fonts/`.
 
 ## Setup
 

@@ -8,5 +8,12 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Source fonts (see README) and generated fonts
 *.ttf
+*.otf
 /output
+
+# font-viewer images and framebuffer dumps written in the repo root
+/*.png
+/*.bin

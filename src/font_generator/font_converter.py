@@ -84,7 +84,10 @@ class FontConverter:
         blank = config.get("blank", ["U+200D", "U+FE0E", "U+FE0F"])
         if not isinstance(blank, list):
             raise ValueError("blank must be a list of codepoints")
-        self.blank = {self.parse_codepoint(value) for value in blank}
+        try:
+            self.blank = {self.parse_codepoint(value) for value in blank}
+        except ValueError as exc:
+            raise ValueError(f"blank: {exc}") from exc
 
         font_configs = config.get("fonts")
         if not isinstance(font_configs, list) or not font_configs:
@@ -253,7 +256,15 @@ class FontConverter:
     @staticmethod
     def parse_codepoint(value: Any) -> int:
         """Parse U+0041, 0x41, 0041, or a single literal character."""
-        text = str(value).strip()
+        # YAML turns unquoted numbers into ints before we see them, losing
+        # the hex spelling: 0041 arrives as 33 and 0x41 as 65.
+        if not isinstance(value, str):
+            raise ValueError(
+                f"Codepoint {value!r} was read by YAML as a number, so its hex "
+                "spelling is lost (0041 becomes 33, 0x41 becomes 65); write it "
+                "as U+XXXX, e.g. U+0041"
+            )
+        text = value.strip()
         if not text:
             raise ValueError("Empty Unicode codepoint")
 
@@ -321,7 +332,10 @@ class FontConverter:
                 selected.update(valid)
 
             for value in source["individual"]:
-                selected.add(self.parse_codepoint(value))
+                try:
+                    selected.add(self.parse_codepoint(value))
+                except ValueError as exc:
+                    raise ValueError(f"{source['label']}, individual: {exc}") from exc
 
             # Overwrite the source for matching codepoints. This is the core
             # overlay rule: later entries in `fonts` take precedence, but only
